@@ -1,80 +1,143 @@
-/* ULP Example
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
-#include <stdio.h>
-#include <string.h>
+#include "bootloader_random.h"
+#include "driver/adc.h"
+#include "driver/dac.h"
+#include "driver/gpio.h"
+#include "driver/rtc_io.h"
+#include "esp32/ulp.h"
 #include "esp_sleep.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "soc/rtc_cntl_reg.h"
 #include "soc/sens_reg.h"
-#include "driver/gpio.h"
-#include "driver/rtc_io.h"
-#include "driver/adc.h"
-#include "driver/dac.h"
-#include "esp32/ulp.h"
 #include "ulp_main.h"
-
 #include <stdio.h>
+#include <string.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "gdew042t2.h"
+#include <stdio.h>
+
+// screen datasheet -
+// https://thingpulse.com/wp-content/uploads/2019/07/GDEW042T2-V3.1-Specification_.pdf
+
+#define DISPLAY_POWER_PIN GPIO_NUM_16
+#define SCREEN_WIDTH 400
+#define SCREEN_HEIGHT 300
+
+#define WIDTH 24
+#define HEIGHT 18
+
+#define PIXEL_SIZE 400 / WIDTH
+
+RTC_DATA_ATTR bool environment[WIDTH * HEIGHT] = {false};
+RTC_DATA_ATTR uint generation_count = 0;
 
 EpdSpi io;
 Gdew042t2 display(io);
 
-extern "C"
-{
-   void app_main();
+extern "C" {
+void app_main();
 }
 
 void delay(uint32_t millis) { vTaskDelay(millis / portTICK_PERIOD_MS); }
 
-void draw(void)
-{
-   printf("CalEPD version: %s\n", CALEPD_VERSION);
-   // Test Epd class
-   display.init(true);
-   display.update();
+int to_index(int x, int y) { return x + (y * (WIDTH - 1)); }
 
-      // Sizes are calculated dividing the screen in 4 equal parts it may not be perfect for all models
-   uint8_t rectW = display.width()/4; // For 11 is 37.
+bool test_alive(bool env[WIDTH * HEIGHT], int x, int y) {
+  if (x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT)
+    return false;
+  return env[to_index(x, y)];
+}
 
-   uint16_t foregroundColor = EPD_WHITE;
-   // Make some rectangles showing the different colors or grays
-   if (display.colors_supported>1) {
-      printf("display.colors_supported:%d\n", display.colors_supported);
-      foregroundColor = EPD_RED;
-   }
-   
-   display.fillScreen(EPD_WHITE);
-   uint16_t firstBlock = display.width()/4;
-   display.fillRect(    1,1,rectW, firstBlock,foregroundColor);
-   display.fillRect(rectW,1,rectW, firstBlock,EPD_WHITE);
-   display.fillRect(rectW*2,1,rectW,firstBlock,foregroundColor); 
-   display.fillRect(rectW*3,1,rectW-2,firstBlock,EPD_WHITE);
+void debug(bool env[WIDTH * HEIGHT]) {
+  for (int x = 0; x < WIDTH; x++) {
+    printf("\n");
+    for (int y = 0; y < HEIGHT; y++) {
+      if (test_alive(env, x, y))
+        printf("*");
+      else
+        printf(".");
+    }
+  }
+}
 
-   display.fillRect(    1,firstBlock,rectW,firstBlock,EPD_BLACK);
-   display.fillRect(rectW,firstBlock,rectW,firstBlock,foregroundColor);
-   display.fillRect(rectW*2,firstBlock,rectW,firstBlock,EPD_BLACK); 
-   display.fillRect(rectW*3,firstBlock,rectW-2,firstBlock,foregroundColor);
+void init_environment() {
+  bootloader_random_enable();
+  uint random_data[WIDTH * HEIGHT];
+  esp_fill_random(random_data, sizeof(random_data));
+  bootloader_random_disable();
 
-   display.update();
-   // Leave the epaper White ready for storage
-   delay(2000);
-   display.fillScreen(EPD_WHITE);
-   display.update();
+  for (int i = 0; i < WIDTH * HEIGHT; i++) 
+    environment[i] = random_data[i] & 0x01;
+  generation_count = 0;
+}
 
-   printf("display: We are done here");
+int count_living_neighbours(bool env[WIDTH * HEIGHT], int x, int y) {
+  int count = 0;
+  for (int y_delta = -1; y_delta <= 1; y_delta++)
+    for (int x_delta = -1; x_delta <= 1; x_delta++) {
+      if (x_delta == 0 && y_delta == 0) // don't count ourselves
+        continue;
+      if (count > 3) // early return b/c we don't care about counts > 3
+        return count;
+      if (test_alive(env, x + x_delta, y + y_delta))
+        count++;
+    }
+  return count;
+}
+
+void draw(void) {
+  bool all_dead = true;
+  for (int i = 0; all_dead && i < WIDTH * HEIGHT; i++)
+    all_dead = !environment[i];
+
+  if (all_dead)
+    init_environment();
+
+  bool next[WIDTH * HEIGHT] = {false};
+  for (int x = 0; x < WIDTH; x++) {
+    for (int y = 0; y < HEIGHT; y++) {
+      int living_neighbour_count = count_living_neighbours(environment, x, y);
+      bool is_alive = test_alive(environment, x, y);
+      bool will_be_alive = false;
+
+      if (is_alive &&
+          (living_neighbour_count == 2 || living_neighbour_count == 3))
+        will_be_alive = true;
+      else if (!is_alive && living_neighbour_count == 3)
+        will_be_alive = true;
+
+      next[to_index(x, y)] = will_be_alive;
+    }
+  }
+  memcpy(environment, next, sizeof(next));
+
+  gpio_reset_pin(DISPLAY_POWER_PIN);
+  gpio_set_direction(DISPLAY_POWER_PIN, GPIO_MODE_OUTPUT);
+  gpio_set_level(DISPLAY_POWER_PIN, 1);
+
+  display.init();
+  for (int x = 0; x < WIDTH; x++)
+    for (int y = 0; y < HEIGHT; y++)
+      if (test_alive(environment, x, y))
+        display.fillRect(x * PIXEL_SIZE, y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE,
+                         EPD_BLACK);
+  // display.fillCircle(x * PIXEL_SIZE, y * PIXEL_SIZE, PIXEL_SIZE/2,
+  // EPD_BLACK);
+
+  display.setCursor(2, SCREEN_HEIGHT - (PIXEL_SIZE / 2));
+  display.setTextColor(test_alive(environment, 0, HEIGHT-1) ? EPD_WHITE : EPD_BLACK);
+  display.print(std::to_string(generation_count));
+
+  display.update();
+  gpio_set_level(DISPLAY_POWER_PIN, 0);
+
+  generation_count++;
 }
 
 extern const uint8_t ulp_main_bin_start[] asm("_binary_ulp_main_bin_start");
-extern const uint8_t ulp_main_bin_end[]   asm("_binary_ulp_main_bin_end");
+extern const uint8_t ulp_main_bin_end[] asm("_binary_ulp_main_bin_end");
 
 /* This function is called once after power-on reset, to load ULP program into
  * RTC memory and configure the ADC.
@@ -86,67 +149,62 @@ static void init_ulp_program(void);
  */
 static void start_ulp_program(void);
 
-void app_main(void)
-{
-    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    if (cause != ESP_SLEEP_WAKEUP_ULP) {
-        printf("Not ULP wakeup\n");
-        init_ulp_program();
-    } else {
-        printf("Deep sleep wakeup\n");
-        printf("ULP did %d measurements since last reset\n", ulp_sample_counter & UINT16_MAX);
-        printf("Thresholds: high=%d\n", ulp_high_thr);
-        ulp_last_result &= UINT16_MAX;
+void app_main(void) {
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  if (cause != ESP_SLEEP_WAKEUP_ULP) {
+    printf("Not ULP wakeup\n");
+    init_ulp_program();
+  } else {
+    printf("Deep sleep wakeup\n");
+    printf("ULP did %d measurements since last reset\n",
+           ulp_sample_counter & UINT16_MAX);
+    printf("Thresholds: high=%d\n", ulp_high_thr);
+    ulp_last_result &= UINT16_MAX;
 
-
-        draw();
-        delay(1000);
-    }
-    printf("Entering deep sleep\n\n");
-    start_ulp_program();
-    ESP_ERROR_CHECK( esp_sleep_enable_ulp_wakeup() );
-    esp_deep_sleep_start();
+    draw();
+  }
+  printf("Entering deep sleep\n\n");
+  start_ulp_program();
+  ESP_ERROR_CHECK(esp_sleep_enable_ulp_wakeup());
+  esp_deep_sleep_start();
 }
 
-static void init_ulp_program(void)
-{
-    esp_err_t err = ulp_load_binary(0, ulp_main_bin_start,
-            (ulp_main_bin_end - ulp_main_bin_start) / sizeof(uint32_t));
-    ESP_ERROR_CHECK(err);
+static void init_ulp_program(void) {
+  esp_err_t err = ulp_load_binary(0, ulp_main_bin_start,
+                                  (ulp_main_bin_end - ulp_main_bin_start) /
+                                      sizeof(uint32_t));
+  ESP_ERROR_CHECK(err);
 
-    /* Configure ADC channel */
-    /* Note: when changing channel here, also change 'adc_channel' constant
-       in adc.S */
-    adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11);
+  /* Configure ADC channel */
+  /* Note: when changing channel here, also change 'adc_channel' constant
+     in adc.S */
+  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11);
 #if CONFIG_IDF_TARGET_ESP32
-    adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_width(ADC_WIDTH_BIT_12);
 #elif CONFIG_IDF_TARGET_ESP32S2
-    adc1_config_width(ADC_WIDTH_BIT_13);
+  adc1_config_width(ADC_WIDTH_BIT_13);
 #endif
-    adc1_ulp_enable();
+  adc1_ulp_enable();
 
-    /* Set low and high thresholds, approx. 1.35V - 1.75V*/
-    ulp_high_thr = 3600;
+  /* Set low and high thresholds, approx. 1.35V - 1.75V*/
+  ulp_high_thr = 3600;
 
-    /* Set ULP wake up period to 2 seconds */
-    ulp_set_wakeup_period(0, 2000000);
+  /* Set ULP wake up period to 2 seconds */
+  ulp_set_wakeup_period(0, 2000000);
 
-    /* Disconnect GPIO12 and GPIO15 to remove current drain through
-     * pullup/pulldown resistors.
-     * GPIO12 may be pulled high to select flash voltage.
-     */
-    rtc_gpio_isolate(GPIO_NUM_12);
-    rtc_gpio_isolate(GPIO_NUM_15);
-    esp_deep_sleep_disable_rom_logging(); // suppress boot messages
+  /* Disconnect GPIO12 and GPIO15 to remove current drain through
+   * pullup/pulldown resistors.
+   * GPIO12 may be pulled high to select flash voltage.
+   */
+  rtc_gpio_isolate(GPIO_NUM_12);
+  rtc_gpio_isolate(GPIO_NUM_15);
+  esp_deep_sleep_disable_rom_logging(); // suppress boot messages
 }
 
-static void start_ulp_program(void)
-{
-    /* Reset sample counter */
-    ulp_sample_counter = 0;
+static void start_ulp_program(void) {
+  /* Reset sample counter */
+  ulp_sample_counter = 0;
 
-    /* Start the program */
-    esp_err_t err = ulp_run(&ulp_entry - RTC_SLOW_MEM);
-    ESP_ERROR_CHECK(err);
+  esp_err_t err = ulp_run(&ulp_entry - RTC_SLOW_MEM);
+  ESP_ERROR_CHECK(err);
 }
-

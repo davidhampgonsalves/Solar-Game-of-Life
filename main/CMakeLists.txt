@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.cpp" INCLUDE_DIRS "." REQUIRES soc nvs_flash ulp driver CalEPD)
+idf_component_register(SRCS "main.cpp" INCLUDE_DIRS "." REQUIRES soc nvs_flash ulp driver CalEPD bootloader_support)
 
 #idf_component_register(SRCS "demo-epaper.cpp" INCLUDE_DIRS "." REQUIRES soc nvs_flash ulp driver CalEPD)
 #
