@@ -18,6 +18,8 @@
 #include "gdew042t2.h"
 #include <stdio.h>
 
+#include <bitset>
+
 // screen datasheet -
 // https://thingpulse.com/wp-content/uploads/2019/07/GDEW042T2-V3.1-Specification_.pdf
 
@@ -25,13 +27,17 @@
 #define SCREEN_WIDTH 400
 #define SCREEN_HEIGHT 300
 
-#define WIDTH 24
-#define HEIGHT 18
+// the previous generation needs to be written to deep sleep stable memory which is the limiting factor
+// this size looks the best on my small screen but we could go smaller if we wanted since the bitset 
+// uses 1 bit per boolean value.
+#define WIDTH 50
+#define HEIGHT 37
 
 #define PIXEL_SIZE 400 / WIDTH
 
-RTC_DATA_ATTR bool environment[WIDTH * HEIGHT] = {false};
-RTC_DATA_ATTR uint generation_count = 0;
+bool environment[WIDTH * HEIGHT] = {false};
+RTC_NOINIT_ATTR static std::bitset<WIDTH * HEIGHT> previous;
+RTC_NOINIT_ATTR int generation_count;
 
 EpdSpi io;
 Gdew042t2 display(io);
@@ -39,8 +45,6 @@ Gdew042t2 display(io);
 extern "C" {
 void app_main();
 }
-
-void delay(uint32_t millis) { vTaskDelay(millis / portTICK_PERIOD_MS); }
 
 int to_index(int x, int y) { return x + (y * (WIDTH - 1)); }
 
@@ -64,13 +68,12 @@ void debug(bool env[WIDTH * HEIGHT]) {
 
 void init_environment() {
   bootloader_random_enable();
-  uint random_data[WIDTH * HEIGHT];
+  unsigned char random_data[WIDTH * HEIGHT];
   esp_fill_random(random_data, sizeof(random_data));
   bootloader_random_disable();
 
   for (int i = 0; i < WIDTH * HEIGHT; i++) 
     environment[i] = random_data[i] & 0x01;
-  generation_count = 0;
 }
 
 int count_living_neighbours(bool env[WIDTH * HEIGHT], int x, int y) {
@@ -88,12 +91,13 @@ int count_living_neighbours(bool env[WIDTH * HEIGHT], int x, int y) {
 }
 
 void draw(void) {
-  bool all_dead = true;
-  for (int i = 0; all_dead && i < WIDTH * HEIGHT; i++)
-    all_dead = !environment[i];
-
-  if (all_dead)
+  if(generation_count % 100 == 0) // argegedon ever 100 generations to avoid loops
     init_environment();
+  else {
+    // restore environment from last run
+    for (int i = 0; i < WIDTH * HEIGHT; i++)  
+      environment[i] = previous[i];
+  }
 
   bool next[WIDTH * HEIGHT] = {false};
   for (int x = 0; x < WIDTH; x++) {
@@ -111,11 +115,16 @@ void draw(void) {
       next[to_index(x, y)] = will_be_alive;
     }
   }
-  memcpy(environment, next, sizeof(next));
+
+  // write the state back to the bitset for compact storage
+  for (int i = 0; i < WIDTH * HEIGHT; i++)  
+    previous[i] = next[i];
 
   gpio_reset_pin(DISPLAY_POWER_PIN);
   gpio_set_direction(DISPLAY_POWER_PIN, GPIO_MODE_OUTPUT);
   gpio_set_level(DISPLAY_POWER_PIN, 1);
+
+  vTaskDelay(100 / portTICK_RATE_MS);
 
   display.init();
   for (int x = 0; x < WIDTH; x++)
@@ -123,10 +132,8 @@ void draw(void) {
       if (test_alive(environment, x, y))
         display.fillRect(x * PIXEL_SIZE, y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE,
                          EPD_BLACK);
-  // display.fillCircle(x * PIXEL_SIZE, y * PIXEL_SIZE, PIXEL_SIZE/2,
-  // EPD_BLACK);
 
-  display.setCursor(2, SCREEN_HEIGHT - (PIXEL_SIZE / 2));
+  display.setCursor(3, SCREEN_HEIGHT - (PIXEL_SIZE / 2) - 4);
   display.setTextColor(test_alive(environment, 0, HEIGHT-1) ? EPD_WHITE : EPD_BLACK);
   display.print(std::to_string(generation_count));
 
@@ -154,6 +161,7 @@ void app_main(void) {
   if (cause != ESP_SLEEP_WAKEUP_ULP) {
     printf("Not ULP wakeup\n");
     init_ulp_program();
+    generation_count = 1;
   } else {
     printf("Deep sleep wakeup\n");
     printf("ULP did %d measurements since last reset\n",
@@ -186,8 +194,8 @@ static void init_ulp_program(void) {
 #endif
   adc1_ulp_enable();
 
-  /* Set low and high thresholds, approx. 1.35V - 1.75V*/
-  ulp_high_thr = 3600;
+  /* Set the high threshold */
+  ulp_high_thr = 3.2 * (4095 / 3.3); // about 3v
 
   /* Set ULP wake up period to 2 seconds */
   ulp_set_wakeup_period(0, 2000000);
