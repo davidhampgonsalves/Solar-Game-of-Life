@@ -1,4 +1,4 @@
-![](https://github.com/davidhampgonsalves/solar-game-of-life/timelapse.gif)
+![timelapse](https://github.com/davidhampgonsalves/solar-game-of-life/assets/178893/fb31dc91-b645-4bbe-a6fb-8fa406ff8aac)
 
 This is a solar powered, e-ink based version of [Conways Game of Life](https://en.wikipedia.org/wiki/Conway%27s_Game_of_Life) which runs on an ESP-32 and uses the ULP processor to monitor its power level to only calculate the next iteration and update the display when we reach the given 3.3v threshold.
 
