@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "gdew042t2.h"
+#include <inttypes.h>
 #include <stdio.h>
 
 #include <bitset>
@@ -27,9 +28,9 @@
 #define SCREEN_WIDTH 400
 #define SCREEN_HEIGHT 300
 
-// the previous generation needs to be written to deep sleep stable memory which is the limiting factor
-// this size looks the best on my small screen but we could go smaller if we wanted since the bitset 
-// uses 1 bit per boolean value.
+// the previous generation needs to be written to deep sleep stable memory which
+// is the limiting factor this size looks the best on my small screen but we
+// could go smaller if we wanted since the bitset uses 1 bit per boolean value.
 #define WIDTH 50
 #define HEIGHT 37
 
@@ -72,7 +73,7 @@ void init_environment() {
   esp_fill_random(random_data, sizeof(random_data));
   bootloader_random_disable();
 
-  for (int i = 0; i < WIDTH * HEIGHT; i++) 
+  for (int i = 0; i < WIDTH * HEIGHT; i++)
     environment[i] = random_data[i] & 0x01;
 }
 
@@ -91,11 +92,12 @@ int count_living_neighbours(bool env[WIDTH * HEIGHT], int x, int y) {
 }
 
 void draw(void) {
-  if(generation_count % 100 == 0) // argegedon ever 100 generations to avoid loops
+  if (generation_count % 100 ==
+      0) // argegedon ever 100 generations to avoid loops
     init_environment();
   else {
     // restore environment from last run
-    for (int i = 0; i < WIDTH * HEIGHT; i++)  
+    for (int i = 0; i < WIDTH * HEIGHT; i++)
       environment[i] = previous[i];
   }
 
@@ -117,9 +119,11 @@ void draw(void) {
   }
 
   // write the state back to the bitset for compact storage
-  for (int i = 0; i < WIDTH * HEIGHT; i++)  
+  for (int i = 0; i < WIDTH * HEIGHT; i++)
     previous[i] = next[i];
 
+  // gpio_deep_sleep_hold_dis();
+  gpio_hold_dis(DISPLAY_POWER_PIN);
   gpio_reset_pin(DISPLAY_POWER_PIN);
   gpio_set_direction(DISPLAY_POWER_PIN, GPIO_MODE_OUTPUT);
   gpio_set_level(DISPLAY_POWER_PIN, 1);
@@ -134,11 +138,18 @@ void draw(void) {
                          EPD_BLACK);
 
   display.setCursor(3, SCREEN_HEIGHT - (PIXEL_SIZE / 2) - 4);
-  display.setTextColor(test_alive(environment, 0, HEIGHT-1) ? EPD_WHITE : EPD_BLACK);
+  display.setTextColor(test_alive(environment, 0, HEIGHT - 1) ? EPD_WHITE
+                                                              : EPD_BLACK);
   display.print(std::to_string(generation_count));
 
   display.update();
+
+  // gpio_reset_pin(DISPLAY_POWER_PIN);
+  // gpio_set_direction(DISPLAY_POWER_PIN, GPIO_MODE_INPUT);
   gpio_set_level(DISPLAY_POWER_PIN, 0);
+  gpio_set_direction(DISPLAY_POWER_PIN, GPIO_MODE_INPUT);
+  gpio_hold_en(DISPLAY_POWER_PIN);
+  gpio_deep_sleep_hold_en();
 
   generation_count++;
 }
@@ -163,17 +174,19 @@ void app_main(void) {
     init_ulp_program();
     generation_count = 1;
   } else {
-    printf("Deep sleep wakeup\n");
-    printf("ULP did %d measurements since last reset\n",
-           ulp_sample_counter & UINT16_MAX);
-    printf("Thresholds: high=%d\n", ulp_high_thr);
-    ulp_last_result &= UINT16_MAX;
+        printf("Deep sleep wakeup\n");
+        printf("ULP did %"PRIu32" measurements since last reset\n", ulp_sample_counter & UINT16_MAX);
+        printf("Thresholds:  low=%"PRIu32"  high=%"PRIu32"\n", ulp_low_thr, ulp_high_thr);
+        ulp_last_result &= UINT16_MAX;
+        printf("Value=%"PRIu32" was %s threshold\n", ulp_last_result,
+                ulp_last_result < ulp_low_thr ? "below" : "above");
 
     draw();
   }
   printf("Entering deep sleep\n\n");
   start_ulp_program();
   ESP_ERROR_CHECK(esp_sleep_enable_ulp_wakeup());
+
   esp_deep_sleep_start();
 }
 
@@ -195,10 +208,12 @@ static void init_ulp_program(void) {
   adc1_ulp_enable();
 
   /* Set the high threshold */
-  ulp_high_thr = 3.2 * (4095 / 3.3); // about 3v
+  // When the main core runs it polls the voltage down by ~0.5v which will cause it to brownout 
+  // even when the ULP is reading 3v.
+  ulp_high_thr = 1880; // about 3.3v with voltage divider (which is essential b/c the esp32 doesn't report voltages that high reliabily)
 
-  /* Set ULP wake up period to 2 seconds */
-  ulp_set_wakeup_period(0, 2000000);
+  /* Set ULP wake up period to 10 seconds */
+  ulp_set_wakeup_period(0, 10000000);
 
   /* Disconnect GPIO12 and GPIO15 to remove current drain through
    * pullup/pulldown resistors.
